@@ -1,0 +1,4 @@
+# Normalize line endings: store LF in the repository, convert on checkout per platform.
+# Without this, a Windows working tree reports the entire repository as modified
+# (git sees CRLF on disk vs LF in the index), which buries real changes in noise.
+* text=auto
