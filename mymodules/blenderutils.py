@@ -6,9 +6,15 @@ This software is released under the MIT License.
 http://opensource.org/licenses/mit-license.php
 """
 
+from __future__ import annotations  # 注解延迟求值: bpy 缺席时 bpy.types.* 注解不会在导入期报错
+
 from pathlib import Path
 import math
-import bpy
+
+try:
+    import bpy
+except ImportError:  # bpy 只在网格导出/重打光路径用到, 训练与推理不需要
+    bpy = None
 
 SPACE = 50  # space between two shading nodes
 SHIFT_Y = 100  # shift value (y) for whole shading nodes
