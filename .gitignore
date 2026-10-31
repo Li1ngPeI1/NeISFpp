@@ -136,3 +136,9 @@ configs/*
 
 env_maps/*
 !env_maps/.gitkeep
+
+# Local experiment artifacts (kept on disk, not versioned)
+logs/
+scripts/
+Summary/
+figures/

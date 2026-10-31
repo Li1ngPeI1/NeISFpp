@@ -36,6 +36,39 @@ MODELS_FOLDER_NAME = "models"
 SAVED_CONFIG_NAME = "parameters.json"
 
 
+class DepolScale(nn.Module):
+    """ Learnable coefficient ``c`` in ``xi_par = 1 - c * W(sigma_bar)``.
+
+    Paper one is ``c = 1``; making it learnable turns "is ``1 - W`` the right
+    amplitude?" into a measurable question instead of an assumption.
+
+    The admissible range is not symmetric.  Within paper one's diffuse Mueller
+    family, Cloude/PSD realizability forces ``c >= 1`` at the reachable
+    ``|P_L| <= ~0.58`` (weaker depolarization is *not* a physical Mueller matrix),
+    and the boundary crosses that ``|P_L|`` at about ``c = 1.75``.  So ``C_MAX = 1.7``.
+
+    Parametrisation::
+
+        c_raw = 1 + (C_MAX - 1) * (2 * sigmoid(raw) - 1)
+        c     = clamp(c_raw, min=1)
+
+    At ``raw = 0`` this is exactly ``1`` and ``dc_raw/draw = (C_MAX-1)/2``, so the
+    gradient is not stuck at the boundary; the clamp only blocks the unphysical side.
+    ``scripts/check_depol_scale.py`` asserts both (c == 1 and a non-zero grad) so a
+    silent "stuck at 1" cannot be mistaken for "the data prefers 1".
+    """
+
+    C_MAX = 1.7
+
+    def __init__(self):
+        super().__init__()
+        self.raw = nn.Parameter(torch.zeros(()))
+
+    def forward(self) -> Tensor:
+        c = 1.0 + (self.C_MAX - 1.0) * (2.0 * torch.sigmoid(self.raw) - 1.0)
+        return torch.clamp(c, min=1.0)
+
+
 class TrainerBase:
     """ Base class of all the other trainers.
 
@@ -51,6 +84,18 @@ class TrainerBase:
         embedder_pos (Embedder): positional encoding for 3D positions.
         gain (float): a parameter for adjusting the overall image intensity
         is_training (bool): True when training, False otherwise.
+        is_aniso (bool): True to model the surface with the anisotropic GGX of
+            ``mymodules/anisobrdf.py`` (per-pixel ``alpha_x, alpha_y, phi_t``)
+            instead of upstream's isotropic roughness scalar.  Default False, so
+            an unmodified config reproduces upstream's code path exactly.
+        is_depol (bool): True to give the diffuse term paper one's physical,
+            roughness-dependent depolarizer (``mymodules/depolbrdf.py``) in place of
+            the ideal depolarizer upstream implicitly assumes.  Default False, so an
+            unmodified config reproduces upstream's code path exactly.
+        is_depol_learn_scale (bool): True to make the coefficient ``c`` in
+            ``xi_par = 1 - c * W`` learnable (init ``c = 1``, i.e. paper one).  Only
+            takes effect together with ``depol_brdf``; when off, no extra module is
+            created and ``c`` is the constant ``1.0``.
         loss_eikonal (EikonalLoss): eikonal loss.
         lr (float): learning rate.
         max_epoch (int): maximum epochs.
@@ -77,10 +122,17 @@ class TrainerBase:
                  weight_dic: dict,
                  config_path: Path,
                  use_mask: bool,
-                 gain: float):
-        
+                 gain: float,
+                 aniso_brdf: bool = False,
+                 depol_brdf: bool = False,
+                 depol_learn_scale: bool = False):
+
         self.gain = gain
         self.is_training = is_training
+        self.is_aniso = aniso_brdf
+        self.is_depol = depol_brdf
+        # only meaningful together with the depol increment; off -> no extra module.
+        self.is_depol_learn_scale = bool(depol_learn_scale) and bool(depol_brdf)
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.max_epoch = max_epoch
@@ -128,8 +180,20 @@ class TrainerBase:
             sphere_scale=1.0,
         )
 
+        if self.is_depol_learn_scale:
+            # A single scalar.  It lives in ``models_dic`` so the existing optimizer,
+            # scheduler, save/load and device-placement machinery all handle it with
+            # no special cases.  Checkpoint name: ``epXXXXX_depolscale.pth``.
+            self.models_dic["depolscale"] = DepolScale()
+
         self.eik_weight = weight_dic["eik_weight"]
         self.loss_eikonal = EikonalLoss()
+
+    def depol_scale_value(self):
+        """ ``c`` in ``xi_par = 1 - c * W``; ``1.0`` when the learnable scale is off. """
+        if "depolscale" in self.models_dic:
+            return self.models_dic["depolscale"]()
+        return 1.0
 
     def train(self):
         """ Main function for training.

@@ -130,8 +130,12 @@ class MyDataset(Dataset):
         self.camera_axis_pool = []
         if self.use_c_mask:
             self.c_mask_pool = []
-        if self.is_synthetic and not self.is_training:
+        if self.is_synthetic:
+            # Normals are loaded during training too: the synthetic experiments
+            # use them for an optional geometry-supervision loss (normal_weight),
+            # because photometry alone does not pin the SDF on a smooth sphere.
             self.normal_pool = []
+        if self.is_synthetic and not self.is_training:
             self.albedo_pool = []
             self.roughness_pool =[]
         if self.is_neisfpp and not self.is_training:
@@ -166,6 +170,8 @@ class MyDataset(Dataset):
         self.camera_axis_train = torch.cat(self.camera_axis_pool, dim=0)
         self.rays_o_train = torch.cat(self.rays_o_pool, dim=0)
         self.rays_d_train = torch.cat(self.rays_d_pool, dim=0)
+        if self.is_synthetic:
+            self.normal_train = torch.cat(self.normal_pool, dim=0)  # (N, 3)
         if self.use_c_mask:
             self.c_mask_train = torch.cat(self.c_mask_pool, dim=0)
 
@@ -179,6 +185,8 @@ class MyDataset(Dataset):
             self.camera_axis_train = self.camera_axis_train[mask]  # (N, 3)
             self.rays_o_train = self.rays_o_train[mask]  # (N, 3)
             self.rays_d_train = self.rays_d_train[mask]  # (N, 3)
+            if self.is_synthetic:
+                self.normal_train = self.normal_train[mask]  # (N, 3)
             if self.use_c_mask:
                 self.c_mask_train = self.c_mask_train[mask]  # (N, 3)
 
@@ -251,6 +259,14 @@ class MyDataset(Dataset):
         }
         if self.use_c_mask:
             batch_dic["c_mask"] = self.c_mask_train[idx]
+        # Per-ray object mask. With use_mask=True every sampled ray is inside the
+        # object (all ones); with use_mask=False this lets the trainers keep the
+        # normal / DoP losses off the background rays, whose GT is meaningless.
+        # NOTE: DataLoader calls __getitem__ with a scalar index, so index both
+        # dims directly (mask_train[idx] would be a length-3 vector).
+        batch_dic["mask"] = self.mask_train[idx, 0]  # scalar bool -> collated to (b_size,)
+        if self.is_synthetic:
+            batch_dic["normal_gt"] = self.normal_train[idx]  # (b_size, 3), world space
         return batch_dic
 
 
@@ -333,13 +349,14 @@ class NeISFDataset(MyDataset):
             self.rays_o_pool.append(rays_o)  # (h * w, 3)
             self.rays_d_pool.append(rays_d)  # (h * w, 3)
 
-            if self.is_synthetic and not self.is_training:
+            if self.is_synthetic:
                 normal = my_read_image(self.data_path.joinpath("normals", "img_{:03d}.png".format(idx + 1))) / MAX_16BIT
                 normal = normal * 2. - 1.
                 normal = Func.normalize(torch.from_numpy(normal).reshape(-1, 3))
                 normal = rotate_normal_from_tangent_to_world(w2c, rays_d, normal)
                 self.normal_pool.append(normal)
 
+            if self.is_synthetic and not self.is_training:
                 albedo = my_read_image(self.data_path.joinpath("albedos", "img_{:03d}.png".format(idx + 1))) / MAX_16BIT
                 albedo = torch.from_numpy(albedo).reshape(-1, 3)
                 self.albedo_pool.append(albedo)

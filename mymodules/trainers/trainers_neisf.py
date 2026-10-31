@@ -18,7 +18,9 @@ from .trainers_base import TrainerBase, BlenderExportMixin
 
 import mymodules.models.neisf as neisf
 
+from mymodules import anisobrdf
 from mymodules import brdfutils
+from mymodules import depolbrdf
 from mymodules import embedders
 from mymodules import polarutils
 from mymodules import shapeutils
@@ -71,6 +73,56 @@ def _write_all_images_in_dict_for_neisf(save_path: Path, idx: int, images_dict: 
     return all_image_is_saved
 
 
+def diffuse_stokes_full(use_depol: bool,
+                        brdf_params,
+                        wo_wld: torch.Tensor,
+                        wi_wld: torch.Tensor,
+                        n_wld: torch.Tensor,
+                        cam_axis: torch.Tensor,
+                        s0: torch.Tensor,
+                        s1: torch.Tensor,
+                        xi_scale=1.0):
+    """ Diffuse Stokes, with the ``depol_brdf`` increment dispatched on ``use_depol``.
+
+    One helper rather than an ``if`` at each of the five diffuse call sites, because
+    the property that matters -- **with the flag off this is upstream's function,
+    unchanged** -- is then auditable in a single place, and because a missed site
+    would silently mix two forward models inside one render.
+
+    Both branches return ``(S0, S1, S2)`` with identical shapes and frame convention;
+    see ``mymodules/depolbrdf.py`` for what the depolarizing one computes and
+    ``scripts/check_depol_wiring.py`` for the check that the two agree exactly at the
+    flag's off state.
+
+    ``brdf_params`` is ignored by the upstream branch, which takes no roughness --
+    upstream's diffuse does not depend on it.
+
+    ``xi_scale`` is ``c`` in ``xi_par = 1 - c * W`` (paper one: ``c = 1``).  It is
+    ignored by the upstream branch and by the depolarizing branch when the trainer
+    has no learnable coefficient (``c = 1.0`` there), so the two original paths are
+    bit-identical.
+    """
+    if use_depol:
+        return depolbrdf.calc_diffuse_stokes_depol(
+            wo_wld=wo_wld,
+            wi_wld=wi_wld,
+            n_wld=n_wld,
+            cam_axis=cam_axis,
+            s0=s0,
+            s1=s1,
+            brdf_params=brdf_params,
+            xi_scale=xi_scale,
+        )
+    return polarutils.calc_diffuse_stokes_full(
+        wo_wld=wo_wld,
+        wi_wld=wi_wld,
+        n_wld=n_wld,
+        cam_axis=cam_axis,
+        s0=s0,
+        s1=s1,
+    )
+
+
 class TrainerNeISF(BlenderExportMixin, TrainerBase):
     """ Trainer for Neural Incident Stokes Field (refer to https://openaccess.thecvf.com/content/CVPR2024/html/Li_NeISF_Neural_Incident_Stokes_Field_for_Geometry_and_Material_Estimation_CVPR_2024_paper.html).
 
@@ -107,7 +159,10 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
                  previous_stage_epoch_num: int,
                  max_step_ray_march: int,
                  use_mask: bool,
-                 gain: float):
+                 gain: float,
+                 aniso_brdf: bool = False,
+                 depol_brdf: bool = False,
+                 depol_learn_scale: bool = False):
 
         super(TrainerNeISF, self).__init__(
             is_training=is_training,
@@ -123,7 +178,10 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
             weight_dic=weight_dic,
             config_path=config_path,
             use_mask=use_mask,
-            gain=gain
+            gain=gain,
+            aniso_brdf=aniso_brdf,
+            depol_brdf=depol_brdf,
+            depol_learn_scale=depol_learn_scale
         )
 
         self.max_step_ray_march = max_step_ray_march
@@ -163,7 +221,7 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
             depth=4,
             width=256,
             in_ch=self.embedder_pos.out_dim + self.shape_feature_vector_size,
-            out_ch=1,  # roughness has 1 channel.
+            out_ch=3 if self.is_aniso else 1,  # (alpha_x, alpha_y, phi_t) with anisotropy; 1-channel roughness otherwise.
             skips=[4]
         )
 
@@ -377,10 +435,11 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
         incident_s1_diff = incident_s1_diff * incident_s0  # (bs, 3)
 
         # estimate roughness.
-        rough_flat = self.models_dic["rough-net"](inp_wo_dir)  # (bz, 1)
-        rough = calc_weighted_sum(weights=weights, target=rough_flat)  # (b, 1)
-        rough = rough * 0.5 + 0.5  # make sure roughness is between [0, 1]  (b, 1)
-        rough_s = rough.unsqueeze(1).repeat(1, self.illum_sample_num, 1).reshape(-1, 1)  # (bs, 1)
+        rough_flat = self.models_dic["rough-net"](inp_wo_dir)  # (bz, 1) or (bz, 3) when anisotropic
+        rough_raw = calc_weighted_sum(weights=weights, target=rough_flat)  # (b, 1) or (b, 3)
+        # (b, 1) roughness, or (b, 3) = (alpha_x, alpha_y, phi_t) when self.is_aniso.
+        rough, brdf_params = anisobrdf.brdf_params_from_raw(rough_raw, self.is_aniso)
+        brdf_s = brdf_params.unsqueeze(1).repeat(1, self.illum_sample_num, 1).reshape(-1, brdf_params.shape[-1])  # (bs, 1) or (bs, 3)
 
         # estimate albedo.
         albedo_flat = self.models_dic["albedo-net"](inp_wo_dir)  # (bz, 3)
@@ -403,12 +462,15 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
             visibility = ndo > 0.  # (bs, 1)
 
         # render the Distribution and Geometry term
-        fs_s = brdfutils.calc_ggx_reflectance_baek_no_fresnel(
-            view_dir=-rays_d_s, light_dir=wi_s, normal=normal_s, roughness=rough_s,
+        fs_s = anisobrdf.specular_dg(
+            view_dir=-rays_d_s, light_dir=wi_s, normal=normal_s, params=brdf_s,
         )  # (bs, 1)
 
         # render Stokes
-        dif_stokes_s = polarutils.calc_diffuse_stokes_full(
+        dif_stokes_s = diffuse_stokes_full(
+            use_depol=self.is_depol,
+            xi_scale=self.depol_scale_value(),
+            brdf_params=brdf_s,
             wo_wld=-rays_d_s,
             wi_wld=wi_s,
             n_wld=normal_s,
@@ -457,6 +519,7 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
             "normal": normal,
             "visibility": visibility,
             "roughness": rough,
+            "brdf_params": brdf_params,
             "albedo": albedo,
             "z_samples_eik": z_samples_eik
         }
@@ -518,9 +581,12 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
                     albedo = self.models_dic["albedo-net"](inp_wo_dir)  # (bz, 3)
                     albedo = albedo * 0.5 + 0.5  # make sure albedo is between [0, 1].
 
-                    # estimate roughness.
-                    rough = self.models_dic["rough-net"](inp_wo_dir)  # (b, 1)
-                    rough = rough * 0.5 + 0.5  # make sure roughness is between [0, 1].
+                    # estimate roughness. With anisotropy on, the value written here is the
+                    # isotropic-equivalent sqrt(alpha_x * alpha_y): this UV texture is 1-channel
+                    # by construction (reshape_and_scale_all_images), so exporting the individual
+                    # (alpha_x, alpha_y, phi_t) maps needs a separate path.
+                    rough_raw = self.models_dic["rough-net"](inp_wo_dir)  # (b, 1) or (b, 3)
+                    rough, _ = anisobrdf.brdf_params_from_raw(rough_raw, self.is_aniso)
 
                     merge_texture.append(torch.cat((albedo, rough), dim=-1).detach().cpu())
 
@@ -617,7 +683,7 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
                     out_dic = self.forward(rays_o, rays_d, camera_axis, is_training=False)
 
                     normal_wld = out_dic["normal"]  # (b_size, 3)
-                    rough = out_dic["roughness"]  # (b_size, 1)
+                    brdf_p = out_dic["brdf_params"]  # (b_size, 1) or (b_size, 3) with anisotropy
                     albedo = out_dic["albedo"]  # (b_size, 3)
 
                     # sample illumination.
@@ -631,7 +697,7 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
                     normal_wld_bs = normal_wld.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, 3)  # (bs, 3)
                     wi_bs = wi.reshape(-1, 3)  # (bs, 3)
                     illum_bs = illum.reshape(-1, 3)  # (bs, 3)
-                    rough_bs = rough.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, 1)  # (bs, 3)
+                    brdf_bs = brdf_p.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, brdf_p.shape[-1])  # (bs, 1) or (bs, 3)
                     albedo_bs = albedo.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, 3)  # (bs, 3)
                     dummy_stokes_bs = torch.zeros_like(rays_o_bs)  # (bs, 3)
 
@@ -640,12 +706,15 @@ class TrainerNeISF(BlenderExportMixin, TrainerBase):
                     visibility_bs = brdfutils.calc_chi(ndo_bs)  # (bs, 1)
 
                     # render specular reflectance (bs, 1).
-                    fs_bs = brdfutils.calc_ggx_reflectance_baek_no_fresnel(
-                        view_dir=-rays_d_bs, light_dir=wi_bs, normal=normal_wld_bs, roughness=rough_bs,
+                    fs_bs = anisobrdf.specular_dg(
+                        view_dir=-rays_d_bs, light_dir=wi_bs, normal=normal_wld_bs, params=brdf_bs,
                     )
 
                     # render Stokes.
-                    dif_stokes_s = polarutils.calc_diffuse_stokes_full(
+                    dif_stokes_s = diffuse_stokes_full(
+                        use_depol=self.is_depol,
+                        xi_scale=self.depol_scale_value(),
+                        brdf_params=brdf_bs,
                         wo_wld=-rays_d_bs,
                         wi_wld=wi_bs,
                         n_wld=normal_wld_bs,
@@ -729,7 +798,10 @@ class TrainerNeISFNoStokes(TrainerBase):
                  previous_stage_epoch_num: int,
                  max_step_ray_march: int,
                  use_mask: bool,
-                 gain: float):
+                 gain: float,
+                 aniso_brdf: bool = False,
+                 depol_brdf: bool = False,
+                 depol_learn_scale: bool = False):
 
         super(TrainerNeISFNoStokes, self).__init__(
             is_training=is_training,
@@ -745,7 +817,10 @@ class TrainerNeISFNoStokes(TrainerBase):
             weight_dic=weight_dic,
             config_path=config_path,
             use_mask=use_mask,
-            gain=gain
+            gain=gain,
+            aniso_brdf=aniso_brdf,
+            depol_brdf=depol_brdf,
+            depol_learn_scale=depol_learn_scale
         )
 
         self.max_step_ray_march = max_step_ray_march  # set the steps of ray marching
@@ -767,7 +842,7 @@ class TrainerNeISFNoStokes(TrainerBase):
             depth=4,
             width=256,
             in_ch=self.embedder_pos.out_dim + self.shape_feature_vector_size,
-            out_ch=1,  # roughness has 1 channel.
+            out_ch=3 if self.is_aniso else 1,  # (alpha_x, alpha_y, phi_t) with anisotropy; 1-channel roughness otherwise.
             skips=[4]
         )
 
@@ -938,10 +1013,11 @@ class TrainerNeISFNoStokes(TrainerBase):
         incident_s0 = self.models_dic["incident_s0-net"](inp_w_dir)  # (bs, 3)
 
         # estimate roughness.
-        rough_flat = self.models_dic["rough-net"](inp_wo_dir)  # (bz, 1)
-        rough = calc_weighted_sum(weights=weights, target=rough_flat)  # (b, 1)
-        rough = rough * 0.5 + 0.5  # make sure roughness is between [0, 1]  (b, 1)
-        rough_s = rough.unsqueeze(1).repeat(1, self.illum_sample_num, 1).reshape(-1, 1)  # (bs, 1)
+        rough_flat = self.models_dic["rough-net"](inp_wo_dir)  # (bz, 1) or (bz, 3) when anisotropic
+        rough_raw = calc_weighted_sum(weights=weights, target=rough_flat)  # (b, 1) or (b, 3)
+        # (b, 1) roughness, or (b, 3) = (alpha_x, alpha_y, phi_t) when self.is_aniso.
+        rough, brdf_params = anisobrdf.brdf_params_from_raw(rough_raw, self.is_aniso)
+        brdf_s = brdf_params.unsqueeze(1).repeat(1, self.illum_sample_num, 1).reshape(-1, brdf_params.shape[-1])  # (bs, 1) or (bs, 3)
 
         # estimate albedo.
         albedo_flat = self.models_dic["albedo-net"](inp_wo_dir)  # (bz, 3)
@@ -963,8 +1039,8 @@ class TrainerNeISFNoStokes(TrainerBase):
             visibility = ndo > 0.  # (bs, 1)
 
         # render the Distribution and Geometry term
-        fs_s = brdfutils.calc_ggx_reflectance_baek_no_fresnel(
-            view_dir=-rays_d_s, light_dir=wi_s, normal=normal_s, roughness=rough_s,
+        fs_s = anisobrdf.specular_dg(
+            view_dir=-rays_d_s, light_dir=wi_s, normal=normal_s, params=brdf_s,
         )  # (bs, 1)
 
         # render Fresnel term
@@ -983,6 +1059,7 @@ class TrainerNeISFNoStokes(TrainerBase):
             "spe_s0": spe_s0,
             "normal": normal,
             "roughness": rough,
+            "brdf_params": brdf_params,
             "albedo": albedo,
             "visibility": visibility,
             "z_samples_eik": z_samples_eik
@@ -1030,7 +1107,11 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
                  config_path: Path,
                  max_step_ray_march: int,
                  use_mask: bool,
-                 gain: float):
+                 gain: float,
+                 aniso_brdf: bool = False,
+                 depol_brdf: bool = False,
+                 depol_learn_scale: bool = False,
+                 normal_weight: float = 0.0):
 
         super(TrainerNeISFpp, self).__init__(
             is_training=is_training,
@@ -1046,7 +1127,10 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
             weight_dic=weight_dic,
             config_path=config_path,
             use_mask=use_mask,
-            gain=gain
+            gain=gain,
+            aniso_brdf=aniso_brdf,
+            depol_brdf=depol_brdf,
+            depol_learn_scale=depol_learn_scale
         )
 
         self.max_step_ray_march = max_step_ray_march
@@ -1086,7 +1170,7 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
             depth=4,
             width=256,
             in_ch=self.embedder_pos.out_dim + self.shape_feature_vector_size,
-            out_ch=1,  # roughness has 1 channel.
+            out_ch=3 if self.is_aniso else 1,  # (alpha_x, alpha_y, phi_t) with anisotropy; 1-channel roughness otherwise.
             skips=[4]
         )
 
@@ -1112,9 +1196,11 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
             width=256,
             in_ch=self.embedder_pos.out_dim + self.shape_feature_vector_size,
             out_ch=3,  # 3-channel k
-            last_activation_func=nn.Softplus(),  
+            last_activation_func=nn.Softplus(),
             skips=[4]  # no skip
         )
+
+        self.normal_weight = normal_weight  # 0 = disabled (upstream behaviour)
 
         if self.is_training:
             self.dop_weight = weight_dic["dop_weight"]
@@ -1144,6 +1230,8 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
             out_dic = self.forward(rays_o=rays_o, rays_d=rays_d, camera_axis=camera_axis, c_mask=c_mask, is_training=self.is_training)
 
             visibility = out_dic["visibility"].squeeze()  # (b_size,)
+            valid = batch["mask"].bool()  # (b_size,), object mask
+            vis_valid = visibility & valid
 
             dif_s0 = out_dic["dif_s0"]  # (b_size, 3)
             dif_s1 = out_dic["dif_s1"]  # (b_size, 3)
@@ -1169,10 +1257,22 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
             s0_loss = self.loss_stokes(s0_est[visibility], s0[visibility])
             s1_loss = self.loss_stokes(s1_est[visibility], s1[visibility])
             s2_loss = self.loss_stokes(s2_est[visibility], s2[visibility])
-            dop_loss = self.loss_stokes(dop_est[visibility], dop[visibility])
-            aop_loss = self.loss_stokes(aop_est[visibility], aop[visibility])
+            if vis_valid.any():
+                dop_loss = self.loss_stokes(dop_est[vis_valid], dop[vis_valid])
+                aop_loss = self.loss_stokes(aop_est[vis_valid], aop[vis_valid])
+            else:
+                dop_loss = s0_loss.new_zeros(())
+                aop_loss = s0_loss.new_zeros(())
             
             loss = self.stokes_weight * (s0_loss + s1_loss + s2_loss) + self.dop_weight * dop_loss + self.aop_weight * aop_loss + self.eik_weight * ek_loss
+            if self.normal_weight > 0.:
+                # Optional GT-normal supervision (synthetic data only).
+                # Gated by the object mask so background rays (use_mask=False)
+                # do not push the SDF toward meaningless GT normals.
+                normal_gt = batch["normal_gt"]
+                cos = torch.sum(normalize_tensor(out_dic["normal"]) * normal_gt, dim=-1)
+                valid_f = valid.float()
+                loss = loss + self.normal_weight * torch.sum((1. - cos) * valid_f) / valid_f.sum().clamp(min=1.)
 
             # update models.
             self.update_all_models(loss, clip_sdf_grad=True, skip_nan=False)
@@ -1331,10 +1431,11 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
         incident_s1_diff = incident_s1_diff * incident_s0  # (bs, 3)
 
         # estimate roughness.
-        rough_flat = self.models_dic["rough-net"](inp_wo_dir)  # (bz, 1)
-        rough = calc_weighted_sum(weights=weights, target=rough_flat)  # (b, 1)
-        rough = rough * 0.5 + 0.5  # make sure roughness is between [0, 1]  (b, 1)
-        rough_s = rough.unsqueeze(1).repeat(1, self.illum_sample_num, 1).reshape(-1, 1)  # (bs, 1)
+        rough_flat = self.models_dic["rough-net"](inp_wo_dir)  # (bz, 1) or (bz, 3) when anisotropic
+        rough_raw = calc_weighted_sum(weights=weights, target=rough_flat)  # (b, 1) or (b, 3)
+        # (b, 1) roughness, or (b, 3) = (alpha_x, alpha_y, phi_t) when self.is_aniso.
+        rough, brdf_params = anisobrdf.brdf_params_from_raw(rough_raw, self.is_aniso)
+        brdf_s = brdf_params.unsqueeze(1).repeat(1, self.illum_sample_num, 1).reshape(-1, brdf_params.shape[-1])  # (bs, 1) or (bs, 3)
 
         # estimate albedo.
         albedo_flat = self.models_dic["albedo-net"](inp_wo_dir)  # (bz, 3)
@@ -1370,8 +1471,8 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
             visibility = ndo > 0.  # (bs, 1)
 
         # render the Distribution and Geometry term
-        fs_s = brdfutils.calc_ggx_reflectance_baek_no_fresnel(
-            view_dir=-rays_d_s, light_dir=wi_s, normal=normal_s, roughness=rough_s,
+        fs_s = anisobrdf.specular_dg(
+            view_dir=-rays_d_s, light_dir=wi_s, normal=normal_s, params=brdf_s,
         )  # (bs, 1)
 
         # render Stokes for the conductor part 
@@ -1387,7 +1488,10 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
         spe_s0_c_s, spe_s1_c_s, spe_s2_c_s = spe_stokes_c_s
 
         # render stokes for the dielectric part
-        dif_stokes_s = polarutils.calc_diffuse_stokes_full(
+        dif_stokes_s = diffuse_stokes_full(
+            use_depol=self.is_depol,
+            xi_scale=self.depol_scale_value(),
+            brdf_params=brdf_s,
             wo_wld=-rays_d_s,
             wi_wld=wi_s,
             n_wld=normal_s,
@@ -1450,6 +1554,7 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
             "normal": normal,
             "visibility": visibility,
             "roughness": rough,
+            "brdf_params": brdf_params,
             "albedo": albedo,
             "eta": eta,
             "k": k,
@@ -1523,7 +1628,7 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
                     out_dic = self.forward(rays_o, rays_d, camera_axis, c_mask, is_training=False)
 
                     normal_wld = out_dic["normal"]  # (b_size, 3)
-                    rough = out_dic["roughness"]  # (b_size, 1)
+                    brdf_p = out_dic["brdf_params"]  # (b_size, 1) or (b_size, 3) with anisotropy
                     albedo = out_dic["albedo"]  # (b_size, 3)
                     eta = out_dic["eta"]  # (b_size, 3)
                     k = out_dic["k"]  # (b_size, 3)
@@ -1541,7 +1646,7 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
                     normal_wld_bs = normal_wld.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, 3)  # (bs, 3)
                     wi_bs = wi.reshape(-1, 3)  # (bs, 3)
                     illum_bs = illum.reshape(-1, 3)  # (bs, 3)
-                    rough_bs = rough.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, 1)  # (bs, 3)
+                    brdf_bs = brdf_p.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, brdf_p.shape[-1])  # (bs, 1) or (bs, 3)
                     albedo_bs = albedo.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, 3)  # (bs, 3)
                     c_mask_bs = c_mask.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, 3)  # (bs, 3)
                     ior_bs = ior.unsqueeze(1).repeat(1, light_num, 1).reshape(-1, 3)  # (bs, 3)
@@ -1552,8 +1657,8 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
                     visibility_bs = brdfutils.calc_chi(ndo_bs)  # (bs, 1)
 
                     # render specular reflectance (bs, 1).
-                    fs_bs = brdfutils.calc_ggx_reflectance_baek_no_fresnel(
-                        view_dir=-rays_d_bs, light_dir=wi_bs, normal=normal_wld_bs, roughness=rough_bs,
+                    fs_bs = anisobrdf.specular_dg(
+                        view_dir=-rays_d_bs, light_dir=wi_bs, normal=normal_wld_bs, params=brdf_bs,
                     )
 
                     # render Stokes for the conductor part 
@@ -1569,7 +1674,10 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
                     spe_s0_c_s, spe_s1_c_s, spe_s2_c_s = spe_stokes_c_s
 
                     # render stokes for the dielectric part
-                    dif_stokes_s = polarutils.calc_diffuse_stokes_full(
+                    dif_stokes_s = diffuse_stokes_full(
+                        use_depol=self.is_depol,
+                        xi_scale=self.depol_scale_value(),
+                        brdf_params=brdf_bs,
                         wo_wld=-rays_d_bs,
                         wi_wld=wi_bs,
                         n_wld=normal_wld_bs,
@@ -1681,9 +1789,20 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
                     visibility_bs = brdfutils.calc_chi(ndo_bs)  # (bs, 1)
 
                     # render specular reflectance (bs, 1).
+                    # NOTE: this is the only remaining direct call to upstream's isotropic
+                    # function, and it is intentional. This branch re-renders from the
+                    # *ground-truth* roughness of the dataset, which is a single isotropic
+                    # scalar per pixel; there is no (alpha_x, alpha_y, phi_t) to feed the
+                    # anisotropic model, so it stays isotropic regardless of aniso_brdf.
                     fs_bs = brdfutils.calc_ggx_reflectance_baek_no_fresnel(
                         view_dir=-rays_d_bs, light_dir=wi_bs, normal=normal_wld_bs, roughness=rough_bs,
                     )
+
+                    # The depolarization *does* apply in this branch, taking the dataset's
+                    # ground-truth roughness as sigma_bar: that is one isotropic scalar per
+                    # pixel, exactly what the 1-channel branch of
+                    # ``depolbrdf.sigma_bar_from_params`` expects.
+                    brdf_bs = rough_bs
 
                     # render Stokes for the conductor part 
                     spe_stokes_c_s = polarutils.calc_specular_stokes_full_general(
@@ -1698,7 +1817,10 @@ class TrainerNeISFpp(BlenderExportMixin, TrainerBase):
                     spe_s0_c_s, spe_s1_c_s, spe_s2_c_s = spe_stokes_c_s
 
                     # render stokes for the dielectric part
-                    dif_stokes_s = polarutils.calc_diffuse_stokes_full(
+                    dif_stokes_s = diffuse_stokes_full(
+                        use_depol=self.is_depol,
+                        xi_scale=self.depol_scale_value(),
+                        brdf_params=brdf_bs,
                         wo_wld=-rays_d_bs,
                         wi_wld=wi_bs,
                         n_wld=normal_wld_bs,
@@ -1800,7 +1922,10 @@ class TrainerNeISFppNoStokes(BlenderExportMixin, TrainerBase):
                  config_path: Path,
                  max_step_ray_march: int,
                  use_mask: bool,
-                 gain: float):
+                 gain: float,
+                 aniso_brdf: bool = False,
+                 depol_brdf: bool = False,
+                 depol_learn_scale: bool = False):
 
         super(TrainerNeISFppNoStokes, self).__init__(
             is_training=is_training,
@@ -1816,7 +1941,10 @@ class TrainerNeISFppNoStokes(BlenderExportMixin, TrainerBase):
             weight_dic=weight_dic,
             config_path=config_path,
             use_mask=use_mask,
-            gain=gain
+            gain=gain,
+            aniso_brdf=aniso_brdf,
+            depol_brdf=depol_brdf,
+            depol_learn_scale=depol_learn_scale
         )
 
         self.max_step_ray_march = max_step_ray_march
@@ -1838,7 +1966,7 @@ class TrainerNeISFppNoStokes(BlenderExportMixin, TrainerBase):
             depth=4,
             width=256,
             in_ch=self.embedder_pos.out_dim + self.shape_feature_vector_size,
-            out_ch=1,  # roughness has 1 channel.
+            out_ch=3 if self.is_aniso else 1,  # (alpha_x, alpha_y, phi_t) with anisotropy; 1-channel roughness otherwise.
             skips=[4]
         )
 
@@ -2038,10 +2166,11 @@ class TrainerNeISFppNoStokes(BlenderExportMixin, TrainerBase):
         incident_s0 = self.models_dic["incident_s0-net"](inp_w_dir)  # (bs, 3)
 
         # estimate roughness.
-        rough_flat = self.models_dic["rough-net"](inp_wo_dir)  # (bz, 1)
-        rough = calc_weighted_sum(weights=weights, target=rough_flat)  # (b, 1)
-        rough = rough * 0.5 + 0.5  # make sure roughness is between [0, 1]  (b, 1)
-        rough_s = rough.unsqueeze(1).repeat(1, self.illum_sample_num, 1).reshape(-1, 1)  # (bs, 1)
+        rough_flat = self.models_dic["rough-net"](inp_wo_dir)  # (bz, 1) or (bz, 3) when anisotropic
+        rough_raw = calc_weighted_sum(weights=weights, target=rough_flat)  # (b, 1) or (b, 3)
+        # (b, 1) roughness, or (b, 3) = (alpha_x, alpha_y, phi_t) when self.is_aniso.
+        rough, brdf_params = anisobrdf.brdf_params_from_raw(rough_raw, self.is_aniso)
+        brdf_s = brdf_params.unsqueeze(1).repeat(1, self.illum_sample_num, 1).reshape(-1, brdf_params.shape[-1])  # (bs, 1) or (bs, 3)
 
         # estimate albedo.
         albedo_flat = self.models_dic["albedo-net"](inp_wo_dir)  # (bz, 3)
@@ -2076,8 +2205,8 @@ class TrainerNeISFppNoStokes(BlenderExportMixin, TrainerBase):
             visibility = ndo > 0.  # (bs, 1)
 
         # render the Distribution and Geometry term
-        fs_s = brdfutils.calc_ggx_reflectance_baek_no_fresnel(
-            view_dir=-rays_d_s, light_dir=wi_s, normal=normal_s, roughness=rough_s,
+        fs_s = anisobrdf.specular_dg(
+            view_dir=-rays_d_s, light_dir=wi_s, normal=normal_s, params=brdf_s,
         )  # (bs, 1)
 
         # render the fresnel reflection term for the conductor part 
@@ -2109,6 +2238,7 @@ class TrainerNeISFppNoStokes(BlenderExportMixin, TrainerBase):
             "normal": normal,
             "visibility": visibility,
             "roughness": rough,
+            "brdf_params": brdf_params,
             "albedo": albedo,
             "eta": eta,
             "k": k,

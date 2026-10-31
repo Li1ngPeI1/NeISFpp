@@ -1,0 +1,27 @@
+{
+    "trainer_name": "TrainerNeISFpp",
+    "data_dir": "aniso_sphere_tex_smoke",
+    "dataset_type": "neisf",
+    "experiment_name": "aniso_sphere_texn_bgcp_s2_iso_seed1",
+    "previous_stage_dir": "aniso_sphere_texn_bgcp_s1_seed1",
+    "previous_stage_epoch_num": 15,
+    "batch_size": 512,
+    "max_epoch": 20,
+    "sample_num": 64,
+    "illum_sample_num": 32,
+    "positional_encoding_x_res": 6,
+    "positional_encoding_d_res": 6,
+    "gpu_num": 0,
+    "lr": 0.0005,
+    "weights": {
+        "eik_weight": 0.1,
+        "stokes_weight": 1.0,
+        "dop_weight": 0.5,
+        "aop_weight": 0.0
+    },
+    "gain": 3.0,
+    "use_mask": true,
+    "max_step_ray_march": 50,
+    "aniso_brdf": false,
+    "normal_weight": 1.0
+}

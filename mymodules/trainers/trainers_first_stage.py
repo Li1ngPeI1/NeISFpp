@@ -211,7 +211,9 @@ class TrainerVolSDFDoP(TrainerBase):
                  weight_dic: dict,
                  config_path: Path,
                  use_mask: bool,
-                 gain: float):
+                 gain: float,
+                 normal_weight: float = 0.0,
+                 mask_weight: float = 0.0):
 
         super(TrainerVolSDFDoP, self).__init__(
             is_training=is_training,
@@ -251,6 +253,8 @@ class TrainerVolSDFDoP(TrainerBase):
             embedder=self.embedder_dir,
             last_activation=nn.Softplus(),
         )
+        self.normal_weight = normal_weight  # 0 = disabled (upstream behaviour)
+        self.mask_weight = mask_weight  # 0 = disabled; two-sided silhouette prior when > 0
         if self.is_training:
             self.loss_rgb = nn.L1Loss()
             self.rgb_weight = weight_dic["rgb_weight"]
@@ -266,21 +270,56 @@ class TrainerVolSDFDoP(TrainerBase):
             s1 = batch["s1"] * self.gain # (b_size, 3)
             s2 = batch["s2"] * self.gain # (b_size, 3)
             dop = calc_dolp_from_s0s1s2(s0, s1, s2)
+            valid = batch["mask"].float()  # (b_size,)
 
             rays_o = batch["rays_o"]  # (b_size, 3)
             rays_d = batch["rays_d"]  # (b_size, 3)
 
-            rgb_values, z_samples_eik, _, dop_values = self.forward(rays_o, rays_d, self.is_training)
+            rgb_values, z_samples_eik, normals, dop_values = self.forward(rays_o, rays_d, self.is_training)
 
-            # calc rgb loss.
+            # calc rgb loss. Background rays are kept when use_mask=False: their
+            # GT radiance is zero, which penalizes wrong background radiance.
+            # It cannot anchor the silhouette by itself, because its gradient
+            # also vanishes at zero density; the mask_weight term does that.
             loss_s0 = self.loss_rgb(rgb_values, s0)
-            loss_dop = self.loss_rgb(dop_values, dop)
+
+            # The GT DoP is undefined on background rays (S0=S1=S2=0 makes the
+            # formula collapse to 1), so gate this term by the object mask.
+            loss_dop_vec = torch.abs(dop_values - dop).mean(dim=-1)  # (b,)
+            loss_dop = torch.sum(loss_dop_vec * valid) / valid.sum().clamp(min=1.)
 
             # calc Eikonal loss.
             grad_theta = self.calc_grad_theta(rays_o, rays_d, z_samples_eik)
             loss_ek = self.loss_eikonal(grad_theta)
 
             loss = self.rgb_weight * loss_s0 + self.eik_weight * loss_ek + self.dop_weight * loss_dop
+            if self.normal_weight > 0.:
+                # Optional GT-normal supervision (synthetic data). The dataset
+                # returns world-space normals, matching the SDF gradient. Gated
+                # by the object mask for the same reason as the DoP term.
+                normal_gt = batch["normal_gt"]
+                cos = torch.sum(normalize_tensor(normals) * normal_gt, dim=-1)
+                loss = loss + self.normal_weight * torch.sum((1. - cos) * valid) / valid.sum().clamp(min=1.)
+            if self.mask_weight > 0.:
+                # Silhouette prior from the object mask. The sphere is centred at
+                # the origin, so the point on each ray closest to the origin is
+                # inside the object exactly for the object rays. Requiring the SDF
+                # to be negative there (and positive for background rays) pins the
+                # silhouette, and therefore the radius. This avoids the rendering
+                # weights: they saturate at the 3-radius clamp shell, which made
+                # an opacity-based version constant and useless.
+                d2 = torch.sum(rays_d * rays_d, dim=-1, keepdim=True).clamp(min=1e-8)
+                t_closest = -torch.sum(rays_o * rays_d, dim=-1, keepdim=True) / d2
+                p_closest = rays_o + torch.clamp(t_closest, min=0.) * rays_d
+                sdf_closest = self.models_dic["sdfnet"].get_sdf_vals(
+                    p_closest, self.data.bounding_sphere_r).squeeze(-1)
+                margin = 0.02
+                bg = 1. - valid
+                loss_sil = (
+                    torch.sum(torch.clamp(sdf_closest + margin, min=0.) * valid) / valid.sum().clamp(min=1.)
+                    + torch.sum(torch.clamp(margin - sdf_closest, min=0.) * bg) / bg.sum().clamp(min=1.)
+                )
+                loss = loss + self.mask_weight * loss_sil
             loss_sum += loss.item()
 
             self.update_all_models(loss, clip_sdf_grad=False)
@@ -335,7 +374,7 @@ class TrainerVolSDFDoP(TrainerBase):
             )
             write_all_images_in_dict(save_path, img_idx, images_dic)
 
-    def forward(self, rays_o: Tensor, rays_d: Tensor, is_training: bool) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward(self, rays_o: Tensor, rays_d: Tensor, is_training: bool) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         # Sampling the positions along the rays.
         z_vals, z_samples_eik = self.sampler.get_z_vals(rays_o, rays_d, self.models_dic["sdfnet"], is_training)
         zn_samples = z_vals.shape[1]
@@ -362,9 +401,9 @@ class TrainerVolSDFDoP(TrainerBase):
         dop_values = torch.sum(weights.unsqueeze(-1) * dop, 1)  # (b_size, 3)
         dop_values = dop_values * 0.5 + 0.5
 
-        if is_training:
+        if is_training and self.normal_weight == 0.:
             normals = None
-        else:  # compute normal only when testing.
+        else:  # normal is also needed in training when the normal loss is on.
             normal_flat = normalize_tensor(gradients)  # (b_size * zn_samples, 3)
             normals = calc_weighted_sum(weights=weights, target=normal_flat)
 

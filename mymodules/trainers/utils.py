@@ -158,7 +158,9 @@ def trainer_provider(config_path: Path,
             weight_dic=configs["weights"],
             config_path=config_path,
             use_mask=configs["use_mask"],
-            gain=configs["gain"]
+            gain=configs["gain"],
+            normal_weight=configs.get("normal_weight", 0.0),
+            mask_weight=configs.get("mask_weight", 0.0)
         )
 
     elif configs["trainer_name"] == "TrainerNeISF":
@@ -167,6 +169,9 @@ def trainer_provider(config_path: Path,
 
         from . import TrainerNeISF
         trainer = TrainerNeISF(
+            aniso_brdf=configs.get("aniso_brdf", False),
+            depol_brdf=configs.get("depol_brdf", False),
+            depol_learn_scale=configs.get("depol_learn_scale", False),
             is_training=is_train,
             data_dir=data_dir,
             dataset_type=configs["dataset_type"],
@@ -194,6 +199,9 @@ def trainer_provider(config_path: Path,
 
         from . import TrainerNeISFNoStokes
         trainer = TrainerNeISFNoStokes(
+            aniso_brdf=configs.get("aniso_brdf", False),
+            depol_brdf=configs.get("depol_brdf", False),
+            depol_learn_scale=configs.get("depol_learn_scale", False),
             is_training=is_train,
             data_dir=data_dir,
             dataset_type=configs["dataset_type"],
@@ -244,6 +252,9 @@ def trainer_provider(config_path: Path,
 
         from . import TrainerNeISFpp
         trainer = TrainerNeISFpp(
+            aniso_brdf=configs.get("aniso_brdf", False),
+            depol_brdf=configs.get("depol_brdf", False),
+            depol_learn_scale=configs.get("depol_learn_scale", False),
             is_training=is_train,
             data_dir=data_dir,
             dataset_type=configs["dataset_type"],
@@ -262,7 +273,8 @@ def trainer_provider(config_path: Path,
             config_path=config_path,
             use_mask=configs["use_mask"],
             max_step_ray_march=configs["max_step_ray_march"],
-            gain=configs["gain"]
+            gain=configs["gain"],
+            normal_weight=configs.get("normal_weight", 0.0)
         )
     elif configs["trainer_name"] == "TrainerNeISFppNoStokes":
         illum_sample_num = \
@@ -270,6 +282,9 @@ def trainer_provider(config_path: Path,
 
         from . import TrainerNeISFppNoStokes
         trainer = TrainerNeISFppNoStokes(
+            aniso_brdf=configs.get("aniso_brdf", False),
+            depol_brdf=configs.get("depol_brdf", False),
+            depol_learn_scale=configs.get("depol_learn_scale", False),
             is_training=is_train,
             data_dir=data_dir,
             dataset_type=configs["dataset_type"],
